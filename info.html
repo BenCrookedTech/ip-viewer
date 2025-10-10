@@ -1,0 +1,241 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>IP & Geo Info</title>
+  <style>
+    body { font-family: Inter, system-ui, Arial; background:#f7fafc; color:#111827; margin:0; padding:20px; }
+    .card { background:white; border-radius:12px; box-shadow:0 6px 18px rgba(9,30,66,0.08); padding:18px; max-width:820px; margin:16px auto; }
+    h1 { margin:0 0 12px 0; font-size:20px; }
+    .row { display:flex; gap:8px; align-items:center; flex-wrap:wrap; margin-bottom:8px; }
+    .label { width:140px; color:#555; font-size:13px; }
+    .value { flex:1; font-size:15px; }
+    button { background:#0369a1; color:white; border:none; border-radius:8px; padding:8px 12px; cursor:pointer; }
+    button.secondary { background:#e6eef6; color:#0369a1; }
+    pre { background:#0f172a; color:#e6eef6; padding:12px; border-radius:8px; overflow:auto; font-size:13px; }
+    .muted { color:#6b7280; font-size:13px; }
+    .small { font-size:13px; color:#374151; }
+    .actions { display:flex; gap:8px; margin-top:12px; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h1>Device IP & Geolocation</h1>
+    <div class="muted">Shows public IP, approximate geolocation (country/region/city/ISP) and local LAN IPs (when available).</div>
+
+    <div style="margin-top:14px;">
+      <div class="row">
+        <div class="label">Public IP</div>
+        <div class="value" id="publicIp">—</div>
+      </div>
+
+      <div class="row">
+        <div class="label">ISP</div>
+        <div class="value" id="isp">—</div>
+      </div>
+
+      <div class="row">
+        <div class="label">Country</div>
+        <div class="value" id="country">—</div>
+      </div>
+
+      <div class="row">
+        <div class="label">Region</div>
+        <div class="value" id="region">—</div>
+      </div>
+
+      <div class="row">
+        <div class="label">City</div>
+        <div class="value" id="city">—</div>
+      </div>
+
+      <div class="row">
+        <div class="label">Timezone</div>
+        <div class="value" id="timezone">—</div>
+      </div>
+
+      <hr style="margin:12px 0; border:none; border-top:1px solid #eef2f7;" />
+
+      <div class="row">
+        <div class="label">Local (LAN) IPs</div>
+        <div class="value" id="localIps">—</div>
+      </div>
+
+      <div class="row small">
+        <div class="label">Note</div>
+        <div class="value">Local IP discovery uses WebRTC. Modern browsers may hide or obfuscate LAN IPs (mDNS); results vary.</div>
+      </div>
+
+      <div class="actions">
+        <button id="refreshBtn">Refresh</button>
+        <button id="copyBtn" class="secondary">Copy details</button>
+      </div>
+
+      <div style="margin-top:12px">
+        <pre id="rawOutput">Waiting for results...</pre>
+      </div>
+    </div>
+  </div>
+
+<script>
+  async function fetchGeoInfo() {
+   
+    const url = 'https://ipapi.co/json/';
+    const res = await fetch(url, {cache: 'no-store'});
+    if (!res.ok) throw new Error('Failed to fetch geo info: ' + res.status);
+    return await res.json();
+  }
+
+  function discoverLocalIPs(timeoutMs = 3000) {
+    return new Promise((resolve) => {
+      const ips = new Set();
+      const rtc = window.RTCPeerConnection || window.webkitRTCPeerConnection || window.mozRTCPeerConnection;
+      if (!rtc) {
+        resolve(['Not supported (no RTCPeerConnection)']);
+        return;
+      }
+
+      const pc = new rtc({iceServers: []});
+      try { pc.createDataChannel(''); } catch (e) { }
+
+      const handleCandidate = (candidate) => {
+        if (!candidate) return;
+        
+        const parts = candidate.split(' ');
+        for (const p of parts) {
+          const ipv4 = p.match(/^(?:\d{1,3}\.){3}\d{1,3}$/);
+          const ipv6 = p.match(/^[0-9a-fA-F:]+$/);
+          if (ipv4) ips.add(ipv4[0]);
+          else if (ipv6 && p.includes(':')) ips.add(p);
+          else {
+            if (p.endsWith('.local')) ips.add(p);
+          }
+        }
+      };
+
+      pc.onicecandidate = (evt) => {
+        if (!evt || !evt.candidate) return;
+        handleCandidate(evt.candidate.candidate || evt.candidate);
+      };
+
+      pc.createOffer().then(offer => pc.setLocalDescription(offer)).catch(() => { /* ignore */ });
+
+      const gatherTimeout = setTimeout(() => {
+        pc.close();
+        if (ips.size === 0) resolve(['No local IPs discovered (may be blocked or obfuscated)']);
+        else resolve(Array.from(ips));
+      }, timeoutMs);
+
+      const tryGetStats = () => {
+        if (!pc.getStats) return;
+        pc.getStats().then(stats => {
+          stats.forEach(report => {
+            if (report && report.candidateType) {
+              if (report.address) ips.add(report.address);
+              if (report.ip) ips.add(report.ip);
+              if (report.hostname) ips.add(report.hostname);
+            } else if (report && report.type === 'remote-candidate' && report.ip) {
+              ips.add(report.ip);
+            } else if (report && report.type === 'local-candidate' && report.ip) {
+              ips.add(report.ip);
+            }
+          });
+        }).catch(() => {});
+      };
+
+      pc.onicegatheringstatechange = () => {
+        if (pc.iceGatheringState === 'complete') {
+          clearTimeout(gatherTimeout);
+          tryGetStats();
+          pc.close();
+          if (ips.size === 0) resolve(['No local IPs discovered (may be blocked or obfuscated)']);
+          else resolve(Array.from(ips));
+        }
+      };
+
+      
+      pc.createOffer().then(offer => {
+        const sdp = offer.sdp || '';
+        sdp.split('\n').forEach(line => {
+          line = line.trim();
+          if (line.indexOf('a=candidate:') === 0) {
+            handleCandidate(line);
+          } else if (line.indexOf('c=IN') === 0) {
+            
+          }
+        });
+      }).catch(() => {  });
+    });
+  }
+
+  const publicIpEl = document.getElementById('publicIp');
+  const ispEl = document.getElementById('isp');
+  const countryEl = document.getElementById('country');
+  const regionEl = document.getElementById('region');
+  const cityEl = document.getElementById('city');
+  const timezoneEl = document.getElementById('timezone');
+  const localIpsEl = document.getElementById('localIps');
+  const rawOutput = document.getElementById('rawOutput');
+  const refreshBtn = document.getElementById('refreshBtn');
+  const copyBtn = document.getElementById('copyBtn');
+
+  async function updateAll() {
+    rawOutput.textContent = 'Fetching...';
+    publicIpEl.textContent = '...';
+    ispEl.textContent = '...';
+    countryEl.textContent = '...';
+    regionEl.textContent = '...';
+    cityEl.textContent = '...';
+    timezoneEl.textContent = '...';
+    localIpsEl.textContent = '...';
+
+    const results = { time: new Date().toISOString() };
+
+    try {
+      const geo = await fetchGeoInfo();
+      publicIpEl.textContent = geo.ip || '—';
+      ispEl.textContent = geo.org || geo.org_name || geo.org || '—';
+      countryEl.textContent = geo.country_name || geo.country || '—';
+      regionEl.textContent = geo.region || '—';
+      cityEl.textContent = geo.city || '—';
+      timezoneEl.textContent = geo.timezone || '—';
+
+      results.geo = geo;
+    } catch (err) {
+      publicIpEl.textContent = 'Error';
+      ispEl.textContent = 'Error';
+      countryEl.textContent = 'Error';
+      regionEl.textContent = 'Error';
+      cityEl.textContent = 'Error';
+      timezoneEl.textContent = 'Error';
+      results.geoError = String(err);
+    }
+
+    try {
+      const local = await discoverLocalIPs(3000);
+      localIpsEl.textContent = Array.isArray(local) ? local.join(', ') : String(local);
+      results.local = local;
+    } catch (err) {
+      localIpsEl.textContent = 'Error';
+      results.localError = String(err);
+    }
+
+    rawOutput.textContent = JSON.stringify(results, null, 2);
+  }
+
+  refreshBtn.addEventListener('click', updateAll);
+
+  copyBtn.addEventListener('click', () => {
+    const text = rawOutput.textContent || '';
+    navigator.clipboard?.writeText(text).then(() => {
+      copyBtn.textContent = 'Copied!';
+      setTimeout(() => copyBtn.textContent = 'Copy details', 1200);
+    }).catch(() => {
+      alert('Unable to copy to clipboard');
+    });
+  });
+  updateAll();
+</script>
+</body>
+</html>
